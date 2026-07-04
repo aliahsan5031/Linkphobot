@@ -1,1024 +1,562 @@
 """
-app.py
-======
-Linkphobot — Production App
-LinkedIn Infographic Generator powered by Groq + Llama 3.3 + PIL
+app.py - Linkphobot
+===================
+Standalone LinkedIn Infographic Generator for Hugging Face Spaces.
+Self-contained: no main_pipeline.py dependency needed.
 
-Entry point for:
-  - Hugging Face Spaces  (SDK: gradio, sdk_version: 3.50.2)
-  - Google Colab         (share=True auto-detected)
-  - Local development    (python app.py)
-
-Architecture:
-  app.py
-    ↓ imports
-  main_pipeline.py          ← master pipeline (PathManager + phase runners)
-    ↓ calls phases
-  linkphobot P1/            ← content generation (Groq API)
-  linkphobot P3/            ← PIL rendering
-  linkphobot P4/            ← typography
-  linkphobot P5/            ← layout
-  linkphobot P6/            ← caption generation
-  linkphobot P7/            ← PNG export
-
-Environment variables:
-  GROQ_API_KEY     : Groq API key (required)
-  LINKPHOBOT_PORT  : server port (default 7860)
-  LINKPHOBOT_SHARE : "true" for Gradio public URL
+HF Secret name: GROQ_API_KEY  OR  Linkphobot_API  (either works)
 """
 
-# ════════════════════════════════════════════════════════════════════════════
-# STDLIB
-# ════════════════════════════════════════════════════════════════════════════
-
-import os
-import sys
-import json
-import time
-import tempfile
-import traceback
+import os, sys, json, re, time, tempfile, traceback
 from datetime import datetime
-from typing import Optional, Tuple, List
-
-# ════════════════════════════════════════════════════════════════════════════
-# THIRD-PARTY
-# ════════════════════════════════════════════════════════════════════════════
-
+from typing import Tuple, Optional
 from PIL import Image, ImageDraw, ImageFont
 import gradio as gr
 
-# ════════════════════════════════════════════════════════════════════════════
-# PATH SETUP
-# Ensures main_pipeline.py and all phase folders can be found
-# regardless of whether we're on Colab, HF Spaces, or local
-# ════════════════════════════════════════════════════════════════════════════
-
-_APP_DIR  = os.path.dirname(os.path.abspath(__file__))
-_ROOTS    = [
-    _APP_DIR,
-    os.path.join(_APP_DIR, ".."),
-    "/content/linkphobot",    # Google Colab
-    "/app",                   # HF Spaces Docker container
-]
-for _r in _ROOTS:
-    if os.path.isdir(_r) and _r not in sys.path:
-        sys.path.insert(0, _r)
-
 
 # ════════════════════════════════════════════════════════════════════════════
-# API KEY LOADER
+# API KEY  — checks every possible secret name
 # ════════════════════════════════════════════════════════════════════════════
 
-def _load_api_key(user_provided: str = "") -> str:
-    """
-    Resolve Groq API key from (in order of priority):
-      1. User input field in the UI
-      2. GROQ_API_KEY environment variable
-      3. Linkphobot_API environment variable  (legacy secret name)
-      4. Google Colab secrets (GROQ_API_KEY or Linkphobot_API)
-
-    Returns the key string, or "" if not found.
-    """
-    # 1. User typed it in the UI
-    if user_provided and user_provided.strip():
-        key = user_provided.strip()
-        os.environ["GROQ_API_KEY"] = key
-        return key
-
-    # 2. Environment variable
-    key = os.environ.get("GROQ_API_KEY", "") or os.environ.get("Linkphobot_API", "")
-    if key:
-        os.environ["GROQ_API_KEY"] = key
-        return key
-
-    # 3. Colab secrets
-    try:
-        from google.colab import userdata
-        key = userdata.get("GROQ_API_KEY") or userdata.get("Linkphobot_API") or ""
-        if key:
-            os.environ["GROQ_API_KEY"] = key
-            return key
-    except Exception:
-        pass
-
+def get_api_key(user_key: str = "") -> str:
+    if user_key and user_key.strip():
+        return user_key.strip()
+    for name in ["GROQ_API_KEY", "Linkphobot_API", "LINKPHOBOT_API",
+                 "groq_api_key", "linkphobot_api"]:
+        val = os.environ.get(name, "").strip()
+        if val:
+            return val
     return ""
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# PIPELINE LOADER
-# Loads main_pipeline.py from disk — works across all environments
+# CONTENT GENERATION  — Groq + Llama 3.3
 # ════════════════════════════════════════════════════════════════════════════
 
-_pipeline_module = None   # cached after first load
+SYSTEM_PROMPT = (
+    "You are an elite LinkedIn infographic content strategist.\n"
+    "CRITICAL: Respond ONLY with pure valid JSON. No markdown. No explanation.\n"
+    "Start with { and end with }. Generate EXACTLY 4 sections.\n"
+    "Bullets max 12 words. Title max 8 words. Subtitle max 15 words.\n"
+)
 
-def _get_pipeline():
-    """
-    Lazy-load main_pipeline.py. Searches common locations.
-    Returns the module object, or None if not found.
-    """
-    global _pipeline_module
-    if _pipeline_module is not None:
-        return _pipeline_module
+VALID_THEMES = {
+    "tech_purple","dev_dark","finance_navy","health_blue","eco_green",
+    "executive_navy","creative_coral","engineering_navy","data_indigo",
+    "clean_blue","edu_teal","people_warm","cyber_dark","professional"
+}
 
-    import importlib.util
+GROQ_MODELS = {
+    "default": "llama-3.3-70b-versatile",
+    "fast":    "llama-3.1-8b-instant",
+    "quality": "llama-3.3-70b-versatile",
+}
 
-    search_paths = [
-        os.path.join(_APP_DIR, "main_pipeline.py"),
-        "/content/linkphobot/main_pipeline.py",
-        "/app/main_pipeline.py",
-        os.path.join(_APP_DIR, "..", "main_pipeline.py"),
+def _extract_json(text):
+    text = re.sub(r"```(?:json)?\s*", "", text)
+    text = re.sub(r"```\s*$", "", text, flags=re.MULTILINE)
+    start = text.find("{")
+    if start == -1: raise ValueError("No JSON found")
+    depth = 0
+    for i, ch in enumerate(text[start:], start=start):
+        if ch == "{": depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0: return text[start:i+1]
+    return text[start:] + "}" * depth
+
+def _repair_json(raw):
+    for fn in [lambda: json.loads(raw),
+               lambda: json.loads(_extract_json(raw))]:
+        try: return fn()
+        except: pass
+    for c in ["}", "}}", "]}}", "]}]}}"]:
+        try: return json.loads(_extract_json(raw) + c)
+        except: pass
+    raise ValueError("Cannot parse JSON: " + raw[:200])
+
+def _validate(data, topic):
+    data.setdefault("title", topic[:60])
+    data.setdefault("subtitle", "Key professional insights for 2025")
+    data.setdefault("sections", [])
+    data.setdefault("key_points", ["Deep expertise drives results",
+                                    "Practice builds mastery",
+                                    "Collaboration amplifies outcomes"])
+    data.setdefault("statistics", [])
+    data.setdefault("call_to_action", "Save this post and share it with your network.")
+    data.setdefault("linkedin_caption", "Key insights on " + topic + ".")
+    data.setdefault("hashtags", ["#LinkedIn", "#Learning", "#Professional"])
+    data.setdefault("color_theme", "professional")
+    data.setdefault("target_audience", "Professionals")
+    data.setdefault("content_type", "educational")
+    if data.get("color_theme") not in VALID_THEMES:
+        data["color_theme"] = "professional"
+    data["sections"] = [
+        {"heading": s.get("heading", "Key Insights"),
+         "icon_suggestion": s.get("icon_suggestion", "📌"),
+         "content": s.get("content", [])[:4]}
+        for s in data.get("sections", []) if isinstance(s, dict)
+    ][:4]
+    data["statistics"] = [
+        {"value": s.get("value",""), "label": s.get("label",""), "context": s.get("context","")}
+        for s in data.get("statistics", []) if isinstance(s, dict) and s.get("value")
+    ][:3]
+    data["hashtags"] = data["hashtags"][:8]
+    return data
+
+def generate_content(topic: str, model: str = "default", api_key: str = "") -> dict:
+    from groq import Groq
+    client = Groq(api_key=api_key)
+    prompt = (
+        "TOPIC: " + topic + "\n\n"
+        "Generate a LinkedIn infographic content plan. Exactly 4 sections.\n\n"
+        "COLOR THEME - return only the theme name:\n"
+        "AI/ML=tech_purple, Healthcare=health_blue, Finance=finance_navy,\n"
+        "Leadership=executive_navy, Sustainability=eco_green, Data=data_indigo,\n"
+        "Education=edu_teal, Tech/Software=dev_dark, Default=professional\n\n"
+        'Return ONLY this JSON: {"title":"","subtitle":"","sections":[{"heading":"",'
+        '"icon_suggestion":"emoji","content":["bullet1","bullet2","bullet3"]}],'
+        '"key_points":[],"statistics":[{"value":"","label":"","context":""}],'
+        '"call_to_action":"","linkedin_caption":"","hashtags":[],'
+        '"color_theme":"","target_audience":"","content_type":"educational"}\n'
+        "EXACTLY 4 SECTIONS. Return ONLY JSON."
+    )
+    t0 = time.time()
+    response = client.chat.completions.create(
+        model       = GROQ_MODELS.get(model, GROQ_MODELS["default"]),
+        messages    = [{"role": "system", "content": SYSTEM_PROMPT},
+                       {"role": "user",   "content": prompt}],
+        temperature = 0.65,
+        max_tokens  = 2800,
+    )
+    elapsed = round(time.time() - t0, 2)
+    raw     = response.choices[0].message.content
+    data    = _validate(_repair_json(raw), topic)
+    data["_tokens"]  = response.usage.total_tokens
+    data["_elapsed"] = elapsed
+    data["_model"]   = response.model
+    return data
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# INFOGRAPHIC RENDERER  — pure PIL, no external dependencies
+# ════════════════════════════════════════════════════════════════════════════
+
+PALETTES = {
+    "tech_purple":     ("#0D0D1A", "#6C3FC5", "#00D4FF", "#B0B0C8"),
+    "health_blue":     ("#EBF8FF", "#0077B6", "#F4A261", "#0077B6"),
+    "finance_navy":    ("#F8F9FA", "#0A2342", "#F7C948", "#2C3E50"),
+    "executive_navy":  ("#FAFBFF", "#1A1F36", "#FF6B35", "#2D3561"),
+    "eco_green":       ("#F0FFF4", "#1B4332", "#95D5B2", "#2D6A4F"),
+    "data_indigo":     ("#FAF8FF", "#3C1053", "#FFB347", "#7B2D8B"),
+    "engineering_navy":("#F5F5F5", "#0A192F", "#64FFDA", "#172A45"),
+    "cyber_dark":      ("#0A0A0A", "#111111", "#00FF41", "#CCCCCC"),
+    "clean_blue":      ("#F8FAFC", "#2563EB", "#FBBF24", "#1E40AF"),
+    "edu_teal":        ("#FFF8F0", "#004E64", "#F4A261", "#00A5CF"),
+    "creative_coral":  ("#FFFBF0", "#FF4E50", "#F9D423", "#FF4E50"),
+    "dev_dark":        ("#11111B", "#89B4FA", "#A6E3A1", "#BAC2DE"),
+    "people_warm":     ("#FFFAF5", "#B5451B", "#FFD166", "#B5451B"),
+    "professional":    ("#FAFBFF", "#1E3A5F", "#FF6B35", "#2E6DA4"),
+}
+
+def _get_font(size: int, bold: bool = False):
+    paths = [
+        "/usr/share/fonts/truetype/liberation/LiberationSans-{}.ttf".format(
+            "Bold" if bold else "Regular"),
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans{}.ttf".format(
+            "-Bold" if bold else ""),
     ]
+    for p in paths:
+        if os.path.isfile(p):
+            try: return ImageFont.truetype(p, size)
+            except: pass
+    return ImageFont.load_default()
 
-    for path in search_paths:
-        if os.path.isfile(path):
-            spec = importlib.util.spec_from_file_location("main_pipeline", path)
-            mod  = importlib.util.module_from_spec(spec)
-            try:
-                spec.loader.exec_module(mod)
-                _pipeline_module = mod
-                print(f"[Linkphobot] Pipeline loaded from: {path}")
-                return _pipeline_module
-            except Exception as e:
-                print(f"[Linkphobot] Failed to load {path}: {e}")
-                continue
+def _tw(text, font):
+    try: return font.getbbox(text)[2]
+    except: return len(text) * 8
 
-    return None
+def _center_text(draw, text, font, y, W, color):
+    draw.text(((W - _tw(text, font)) // 2, y), text, font=font, fill=color)
 
+def render_infographic(content: dict, color_theme: str = "") -> Image.Image:
+    theme = color_theme or content.get("color_theme", "professional")
+    if theme not in PALETTES: theme = "professional"
+    bg, pri, acc, txt = PALETTES[theme]
 
-# ════════════════════════════════════════════════════════════════════════════
-# PLACEHOLDER IMAGE RENDERER
-# Used when Phase 3 renderer fails or pipeline is unavailable
-# ════════════════════════════════════════════════════════════════════════════
+    def h(c):
+        c = c.lstrip("#")
+        return int(c[0:2],16), int(c[2:4],16), int(c[4:6],16)
 
-def _make_placeholder(content: dict) -> Image.Image:
-    """
-    Create a clean branded placeholder infographic using PIL only.
-    No external dependencies — always works as fallback.
-    """
-    PALETTES = {
-        "tech_purple":    ("#0D0D1A", "#6C3FC5", "#00D4FF"),
-        "health_blue":    ("#EBF8FF", "#0077B6", "#F4A261"),
-        "finance_navy":   ("#F8F9FA", "#0A2342", "#F7C948"),
-        "executive_navy": ("#FAFBFF", "#1A1F36", "#FF6B35"),
-        "eco_green":      ("#F0FFF4", "#1B4332", "#95D5B2"),
-        "data_indigo":    ("#FAF8FF", "#3C1053", "#FFB347"),
-        "engineering_navy":("#F5F5F5","#0A192F","#64FFDA"),
-        "cyber_dark":     ("#0A0A0A", "#111111", "#00FF41"),
-        "clean_blue":     ("#F8FAFC", "#2563EB", "#FBBF24"),
-        "edu_teal":       ("#FFF8F0", "#004E64", "#F4A261"),
-        "creative_coral": ("#FFFBF0", "#FF4E50", "#F9D423"),
-        "dev_dark":       ("#11111B", "#89B4FA", "#A6E3A1"),
-        "people_warm":    ("#FFFAF5", "#B5451B", "#FFD166"),
-        "professional":   ("#FAFBFF", "#1E3A5F", "#FF6B35"),
-    }
-
-    theme       = content.get("color_theme", "professional")
-    bg, pri, acc = PALETTES.get(theme, PALETTES["professional"])
-    W, H        = 1080, 1350
-
-    def h2r(h):
-        h = h.lstrip("#")
-        return int(h[0:2],16), int(h[2:4],16), int(h[4:6],16)
-
+    W, H = 1080, 1350
     img  = Image.new("RGB", (W, H), bg)
     draw = ImageDraw.Draw(img)
 
-    # ── Header gradient ───────────────────────────────────────────────────
-    r1,g1,b1 = h2r(pri)
-    r2,g2,b2 = h2r(acc) if theme in ("tech_purple","eco_green","cyber_dark") else (46,109,164)
+    # Fonts
+    f_title = _get_font(52, True)
+    f_sub   = _get_font(24)
+    f_head  = _get_font(26, True)
+    f_body  = _get_font(21)
+    f_small = _get_font(17)
+    f_badge = _get_font(15, True)
+
+    # Header gradient
+    r1,g1,b1 = h(pri)
+    r2,g2,b2 = (46,109,164)
     for y in range(390):
-        t = y / 390
+        t = y/390
         draw.line([(0,y),(W,y)],
-                  fill=(int(r1+(r2-r1)*t*0.45), int(g1+(g2-g1)*t*0.45), int(b1+(b2-b1)*t*0.45)))
+            fill=(int(r1+(r2-r1)*t*0.4), int(g1+(g2-g1)*t*0.4), int(b1+(b2-b1)*t*0.4)))
 
-    # ── Load fonts ────────────────────────────────────────────────────────
-    def _font(sz, bold=False):
-        paths = [
-            f"/content/linkphobot/linkphobot P3/fonts/Inter-{'ExtraBold' if bold else 'Regular'}.ttf",
-            f"/usr/share/fonts/truetype/liberation/LiberationSans-{'Bold' if bold else 'Regular'}.ttf",
-            f"/usr/share/fonts/truetype/dejavu/DejaVuSans{'-Bold' if bold else ''}.ttf",
-        ]
-        for p in paths:
-            if os.path.isfile(p):
-                try: return ImageFont.truetype(p, sz)
-                except Exception: pass
-        return ImageFont.load_default()
-
-    f_title = _font(52, bold=True)
-    f_sub   = _font(24)
-    f_head  = _font(26, bold=True)
-    f_body  = _font(21)
-    f_small = _font(17)
-    f_badge = _font(15, bold=True)
-
-    def _tw(txt, fnt):
-        try: return fnt.getbbox(txt)[2]
-        except: return len(txt) * (fnt.size // 2 if hasattr(fnt,'size') else 8)
-
-    def _center(txt, fnt, y_pos, fill=(255,255,255)):
-        draw.text(((W - _tw(txt, fnt)) // 2, y_pos), txt, font=fnt, fill=fill)
-
-    # ── Content type badge ────────────────────────────────────────────────
-    badge   = content.get("content_type", "educational").upper()
-    acc_rgb = h2r(acc)
+    # Badge
+    badge   = content.get("content_type","educational").upper()
+    acc_rgb = h(acc)
     bw      = _tw(badge, f_badge) + 32
     draw.rounded_rectangle([(W-bw)//2, 42, (W+bw)//2, 78], radius=18, fill=acc_rgb)
-    draw.text(((W - _tw(badge, f_badge)) // 2, 50), badge, font=f_badge, fill=(255,255,255))
+    draw.text(((W - _tw(badge, f_badge))//2, 50), badge, font=f_badge, fill=(255,255,255))
 
-    # ── Title ─────────────────────────────────────────────────────────────
-    title = content.get("title", "Linkphobot Infographic")[:55]
-    _center(title, f_title, 104)
-    subtitle = content.get("subtitle", "")[:72]
-    _center(subtitle, f_sub, 174, fill=h2r("#CBD5E0"))
+    # Title + subtitle
+    title = content.get("title","Linkphobot")[:55]
+    _center_text(draw, title, f_title, 104, W, (255,255,255))
+    subtitle = content.get("subtitle","")[:72]
+    _center_text(draw, subtitle, f_sub, 172, W, h("#CBD5E0"))
 
-    # ── Section cards ─────────────────────────────────────────────────────
-    sections  = content.get("sections", [])
-    pri_rgb   = h2r(pri)
-    txt_rgb   = h2r("#1E3A5F") if bg not in ("#0D0D1A","#0A0A0A","#11111B") else h2r("#E2E8F0")
-    card_bg   = "#FFFFFF" if bg not in ("#FFFFFF","#F8F9FA","#FAFBFF","#F5F5F5","#EBF8FF","#FFF8F0","#FFFBF0","#FFFAF5","#FAF8FF","#F8FAFC","#F0FFF4") else "#EEF4FF"
+    # Section cards
+    sections = content.get("sections",[])
+    pri_rgb  = h(pri)
+    txt_rgb  = h(txt)
+    dark_bg  = bg in ("#0D0D1A","#0A0A0A","#11111B","#0A192F")
+    card_bg  = "#1A1A2E" if dark_bg else "#FFFFFF"
+    cy = 412
 
-    cy = 410
     for i, sec in enumerate(sections[:4]):
-        alt_bg = card_bg if i % 2 == 0 else (
-            "#EEF4FF" if bg not in ("#0D0D1A","#0A0A0A","#11111B") else "#1A1A2E"
-        )
-        draw.rounded_rectangle([54, cy, 1026, cy+148], radius=14, fill=alt_bg)
+        cb = card_bg if i%2==0 else ("#16213E" if dark_bg else "#F0F4FF")
+        draw.rounded_rectangle([54, cy, 1026, cy+148], radius=14, fill=cb)
         draw.rounded_rectangle([54, cy+10, 61, cy+138], radius=4, fill=acc_rgb)
-
         icon    = sec.get("icon_suggestion","")
         heading = (icon + " " + sec.get("heading",""))[:44]
-        draw.text((80, cy+16), heading, font=f_head, fill=pri_rgb if bg not in ("#0D0D1A","#0A0A0A") else h2r("#89B4FA"))
-
+        head_color = h("#89B4FA") if dark_bg else pri_rgb
+        draw.text((80, cy+16), heading, font=f_head, fill=head_color)
         bullets = sec.get("content",[])[:2]
-        by = cy + 60
+        by = cy+60
         for b in bullets:
-            draw.ellipse([80, by+8, 89, by+17], fill=acc_rgb)
-            draw.text((100, by), b[:62], font=f_body, fill=txt_rgb)
+            draw.ellipse([80,by+8,89,by+17], fill=acc_rgb)
+            draw.text((100,by), b[:62], font=f_body, fill=txt_rgb)
             by += 34
         cy += 162
 
-    # ── Key points strip ──────────────────────────────────────────────────
-    kps = content.get("key_points", [])[:3]
+    # Key points
+    kps = content.get("key_points",[])[:3]
     if kps:
-        strip_y = cy + 6
-        draw.rounded_rectangle([54, strip_y, 1026, strip_y+116], radius=12, fill=pri_rgb)
-        kp_x = 80
+        ky = cy+6
+        draw.rounded_rectangle([54,ky,1026,ky+116], radius=12, fill=pri_rgb)
+        kx = 80
         for kp in kps:
-            draw.ellipse([kp_x, strip_y+18, kp_x+8, strip_y+26], fill=acc_rgb)
-            draw.text((kp_x+14, strip_y+12), kp[:45], font=f_small, fill=(255,255,255))
-            kp_x += 316
-        cy = strip_y + 116
+            draw.ellipse([kx,ky+18,kx+8,ky+26], fill=acc_rgb)
+            draw.text((kx+14,ky+12), kp[:44], font=f_small, fill=(255,255,255))
+            kx += 316
+        cy = ky+116
 
-    # ── Statistics ────────────────────────────────────────────────────────
+    # Stats
     stats = content.get("statistics",[])[:3]
     if stats:
-        st_y = cy + 14
-        n    = len(stats)
-        sw   = (972 - 12*(n-1)) // n
-        sx   = 54
-        stat_card = "#EEF4FF" if bg not in ("#0D0D1A","#0A0A0A","#11111B") else "#1A1A2E"
+        sy = cy+14
+        n  = len(stats)
+        sw = (972-12*(n-1))//n
+        sx = 54
+        sc = "#1A1A2E" if dark_bg else "#EEF4FF"
         for stat in stats:
-            draw.rounded_rectangle([sx, st_y, sx+sw, st_y+110], radius=12, fill=stat_card)
-            draw.rounded_rectangle([sx, st_y, sx+sw, st_y+5], radius=3, fill=acc_rgb)
+            draw.rounded_rectangle([sx,sy,sx+sw,sy+110], radius=12, fill=sc)
+            draw.rounded_rectangle([sx,sy,sx+sw,sy+5], radius=3, fill=acc_rgb)
             val = stat.get("value","")
-            vw  = _tw(val, f_head)
-            draw.text((sx+(sw-vw)//2, st_y+14), val, font=f_head, fill=acc_rgb)
+            draw.text((sx+(_tw(val,f_head) and (sw-_tw(val,f_head))//2),sy+14),
+                      val, font=f_head, fill=acc_rgb)
             lbl = stat.get("label","")[:30]
-            lw  = _tw(lbl, f_small)
-            draw.text((sx+(sw-lw)//2, st_y+60), lbl, font=f_small, fill=txt_rgb)
-            sx += sw + 12
-        cy = st_y + 110
+            draw.text((sx+(sw-_tw(lbl,f_small))//2,sy+60),
+                      lbl, font=f_small, fill=txt_rgb)
+            sx += sw+12
 
-    # ── Footer ────────────────────────────────────────────────────────────
-    foot_y = H - 106
-    draw.line([(54, foot_y), (1026, foot_y)], fill=h2r("#E2E8F0"), width=1)
-    cta = content.get("call_to_action","Save this post and share it with your network.")[:68]
-    draw.text(((W - _tw(cta, f_body)) // 2, foot_y+8), cta, font=f_body, fill=pri_rgb)
+    # Footer
+    fy = H-106
+    draw.line([(54,fy),(1026,fy)], fill=h("#E2E8F0"), width=1)
+    cta = content.get("call_to_action","Save and share this post.")[:68]
+    _center_text(draw, cta, f_body, fy+8, W, pri_rgb)
     tags = " ".join(content.get("hashtags",[])[:5])
-    draw.text(((W - _tw(tags, f_small)) // 2, foot_y+46), tags, font=f_small, fill=h2r("#718096"))
+    _center_text(draw, tags, f_small, fy+46, W, h("#718096"))
     brand = "Linkphobot  |  AI-Powered LinkedIn Infographics"
-    draw.text(((W - _tw(brand, f_small)) // 2, H-28), brand, font=f_small, fill=h2r("#A0AEC0"))
+    _center_text(draw, brand, f_small, H-28, W, h("#A0AEC0"))
 
     return img
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# MAIN GENERATE HANDLER
-# Called by every Gradio button / textbox submit event
+# CAPTION BUILDER
 # ════════════════════════════════════════════════════════════════════════════
 
-def generate_infographic(
-    topic:          str,
-    template_name:  str  = "auto",
-    color_theme:    str  = "auto",
-    caption_style:  str  = "educational",
-    export_preset:  str  = "linkedin",
-    model:          str  = "default",
-    groq_api_key:   str  = "",
-) -> Tuple:
-    """
-    Full pipeline handler.
+def build_caption(content: dict) -> str:
+    caption  = content.get("linkedin_caption","")
+    hashtags = " ".join(content.get("hashtags",[]))
+    if not caption:
+        kps     = content.get("key_points",[])
+        kp_text = "\n".join("• " + kp for kp in kps[:3])
+        caption = (
+            content.get("title","") + "\n\n"
+            "Here is what every professional needs to know:\n\n"
+            + kp_text + "\n\n"
+            + content.get("call_to_action","Save and share this post.")
+        )
+    return caption + "\n\n" + hashtags
 
-    Args:
-        topic         : user's topic string
-        template_name : "auto" | "business" | "educational" | "technical"
-        color_theme   : "auto" | any VALID_COLOR_THEMES value
-        caption_style : "educational" | "data_driven" | "thought_leadership" | "story" | "listicle"
-        export_preset : "linkedin" | "linkedin_hq" | "web" | "thumb"
-        model         : "default" | "fast" | "quality"
-        groq_api_key  : optional key override from UI
 
-    Returns:
-        7-tuple matching Gradio OUTPUTS:
-        (status_str, pil_image, caption_str, seo_str, download_path, json_str, metadata_str)
-    """
+# ════════════════════════════════════════════════════════════════════════════
+# MAIN HANDLER
+# ════════════════════════════════════════════════════════════════════════════
 
-    # ── Helper ────────────────────────────────────────────────────────────
-    def _ts(msg: str) -> str:
-        return f"[{datetime.now().strftime('%H:%M:%S')}] {msg}"
+def generate(topic, color_theme, model, caption_style, api_key_input):
+    def ts(m): return f"[{datetime.now().strftime('%H:%M:%S')}] {m}"
 
-    EMPTY = (_ts("Ready"), None, "", "", None, "{}", "")
-
-    # ── Validate topic ────────────────────────────────────────────────────
     topic = (topic or "").strip()
     if len(topic) < 3:
-        return (_ts("Please enter a topic (minimum 3 characters)"),
-                None, "", "", None, "{}", "")
+        return (ts("Please enter a topic (min 3 characters)"),
+                None, "", None, "{}", "")
 
-    # ── Resolve API key ───────────────────────────────────────────────────
-    api_key = _load_api_key(groq_api_key)
+    api_key = get_api_key(api_key_input)
     if not api_key:
         return (
-            _ts("Error: GROQ_API_KEY not found. "
-                "Add it to HF Secrets / Colab Secrets, or paste it above."),
-            None, "", "", None, "{}", ""
+            ts("No API key found — paste your Groq key in the API Key field below"),
+            None,
+            "No API key.\n\nGet a free key at https://console.groq.com/keys\n"
+            "Then paste it in the 'Groq API Key' field in Advanced Settings.",
+            None, "{}", ""
         )
 
-    t_start = time.time()
-    print(f"\n[Linkphobot] Topic: {topic}")
-
-    # ── Load pipeline ─────────────────────────────────────────────────────
-    pipeline = _get_pipeline()
-
-    if pipeline is None:
-        return (
-            _ts("Error: main_pipeline.py not found. "
-                "Ensure it is in the same folder as app.py."),
-            None, "", "", None, "{}", ""
-        )
-
-    # ── Run pipeline ──────────────────────────────────────────────────────
+    t0 = time.time()
     try:
-        bot = pipeline.LinkphoBot(
-            output_dir     = os.path.join(os.path.dirname(os.path.abspath(__file__)), "outputs"),
-            model          = model,
-            template_name  = None if template_name == "auto" else template_name,
-            caption_style  = caption_style,
-            export_preset  = export_preset,
-            api_key        = api_key,
-            use_caption_ai = True,
-            verbose        = True,
+        # Generate content
+        content = generate_content(topic, model, api_key)
+        if color_theme and color_theme != "auto":
+            content["color_theme"] = color_theme
+
+        # Render image
+        img = render_infographic(content)
+
+        # Save PNG
+        tmp = tempfile.mktemp(suffix=".png", prefix="linkphobot_")
+        img.save(tmp, "PNG", optimize=True)
+
+        # Build caption
+        caption = build_caption(content)
+
+        elapsed = round(time.time()-t0, 1)
+        tokens  = content.get("_tokens", 0)
+        json_str= json.dumps(
+            {k:v for k,v in content.items() if not k.startswith("_")},
+            indent=2, ensure_ascii=False)[:4000]
+        meta    = (
+            f"Topic:    {topic}\n"
+            f"Title:    {content.get('title','')}\n"
+            f"Theme:    {content.get('color_theme','')}\n"
+            f"Sections: {len(content.get('sections',[]))}\n"
+            f"Tokens:   {tokens}\n"
+            f"Time:     {elapsed}s\n"
+            f"Model:    {content.get('_model','')}\n"
+            f"Generated:{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
         )
-        result = bot.run(topic)
+
+        return (
+            ts(f"Done in {elapsed}s  |  {content.get('title','')[:45]}"),
+            img,
+            caption,
+            tmp,
+            json_str,
+            meta,
+        )
 
     except Exception as e:
         tb  = traceback.format_exc()
-        msg = f"Pipeline error: {str(e)}"
-        print(f"[Linkphobot] ERROR:\n{tb}")
-        return (_ts(msg), None, msg, "", None, "{}", f"Error:\n{str(e)}\n\n{tb[-400:]}")
+        err = str(e)
+        print(f"[Linkphobot] ERROR: {tb}")
+        return (ts(f"Error: {err[:80]}"), None,
+                f"Error: {err}\n\n{tb[-500:]}", None, "{}", "")
 
-    # ── Handle pipeline failure ───────────────────────────────────────────
-    if not result.success:
-        return (
-            _ts(f"Error: {result.error[:100]}"),
-            None,
-            f"Generation failed:\n{result.error}",
-            "", None, "{}", result.error
-        )
-
-    # ── Apply manual color theme override ─────────────────────────────────
-    # (pipeline auto-detects theme from topic; user can override here)
-    if color_theme and color_theme != "auto":
-        result.content_dict["color_theme"] = color_theme
-
-    # ── Get output image ──────────────────────────────────────────────────
-    # Priority: pipeline rendered images → placeholder fallback
-    if result.rendered_images:
-        image_out = result.rendered_images[0]
-    else:
-        print("[Linkphobot] No rendered images — using placeholder")
-        image_out = _make_placeholder(result.content_dict)
-
-    # ── Get download path ─────────────────────────────────────────────────
-    # Priority: exported PNG from Phase 7 → save image directly
-    download_path = result.primary_image_path or ""
-    if not download_path or not os.path.isfile(download_path):
-        try:
-            tmp_path = tempfile.mktemp(suffix=".png", prefix="linkphobot_")
-            image_out.save(tmp_path, "PNG", optimize=True, compress_level=6)
-            download_path = tmp_path
-        except Exception as e:
-            print(f"[Linkphobot] Warning: could not save PNG: {e}")
-            download_path = ""
-
-    # ── Caption ───────────────────────────────────────────────────────────
-    caption = result.linkedin_post
-    if not caption:
-        # Fallback from Phase 1 content
-        raw_cap = result.content_dict.get("linkedin_caption","")
-        tags    = " ".join(result.content_dict.get("hashtags",[]))
-        caption = f"{raw_cap}\n\n{tags}"
-
-    # ── SEO info line ─────────────────────────────────────────────────────
-    seo_info = ""
-    if result.seo_grade:
-        seo_info = (
-            f"SEO Grade: {result.seo_grade}  ({result.seo_score}/100)  |  "
-            f"Words: {len(caption.split())}  |  "
-            f"Pages: {result.pages_count}  |  "
-            f"Tokens: {result.tokens_used}"
-        )
-
-    # ── JSON content ──────────────────────────────────────────────────────
-    json_str = json.dumps(
-        {k: v for k, v in result.content_dict.items() if not k.startswith("_")},
-        indent=2, ensure_ascii=False
-    )[:5000]
-
-    # ── Metadata ──────────────────────────────────────────────────────────
-    elapsed  = round(time.time() - t_start, 1)
-    metadata = (
-        f"Topic:        {topic}\n"
-        f"Title:        {result.title}\n"
-        f"Theme:        {result.color_theme}\n"
-        f"Content type: {result.content_type}\n"
-        f"Pages:        {result.pages_count}\n"
-        f"Template:     {template_name}\n"
-        f"Model:        {model}\n"
-        f"Caption style:{caption_style}\n"
-        f"Tokens used:  {result.tokens_used}\n"
-        f"Generated in: {elapsed}s\n"
-        f"Phase timings:\n"
-        + "\n".join(f"  {k}: {v}s" for k, v in result.elapsed_by_phase.items())
-        + f"\nGenerated at: {result.generated_at}"
-    )
-
-    status = _ts(
-        f"Done in {elapsed}s  |  {result.title[:45]}  |  "
-        f"SEO: {result.seo_grade or 'N/A'}"
-    )
-    print(f"[Linkphobot] {status}")
-
-    return (
-        status,
-        image_out,
-        caption,
-        seo_info,
-        download_path if download_path and os.path.isfile(download_path) else None,
-        json_str,
-        metadata,
-    )
-
-
-def clear_outputs() -> Tuple:
-    """Reset all UI output components to initial empty state."""
+def clear():
     return (
         f"[{datetime.now().strftime('%H:%M:%S')}] Ready — enter a topic and click Generate",
-        None,   # image
-        "",     # caption
-        "",     # seo
-        None,   # download
-        "{}",   # json
-        "",     # metadata
+        None, "", None, "{}", ""
     )
 
 
-def check_system_status(groq_api_key: str = "") -> str:
-    """Check which components are available and return status string."""
-    api_key = _load_api_key(groq_api_key)
-    pipeline = _get_pipeline()
-
-    lines = ["System Status:\n"]
-
-    lines.append(f"  [{'OK  ' if api_key else 'MISS'}] GROQ_API_KEY")
-    lines.append(f"  [{'OK  ' if pipeline else 'MISS'}] main_pipeline.py")
-
-    if pipeline:
-        pm = getattr(pipeline, "PathManager", None)
-        if pm:
-            for phase_num in [1, 3, 4, 5, 6, 7]:
-                found = pm.find_phase_dir(phase_num)
-                lines.append(f"  [{'OK  ' if found else 'MISS'}] Phase {phase_num}")
-
-    lines.append("")
-    if not api_key:
-        lines.append("  Add GROQ_API_KEY to HF Secrets or paste it in Advanced Settings")
-    if not pipeline:
-        lines.append("  main_pipeline.py not found — ensure it is in the same folder as app.py")
-
-    return "\n".join(lines)
-
-
 # ════════════════════════════════════════════════════════════════════════════
-# UI CONSTANTS
+# GRADIO UI
 # ════════════════════════════════════════════════════════════════════════════
 
-CSS = """
-/* ── Global ─────────────────────────────────────────── */
-.gradio-container {
-    font-family: 'Inter', 'Segoe UI', system-ui, sans-serif !important;
-    max-width: 1200px !important;
-    margin: auto !important;
-}
-
-/* ── Header ─────────────────────────────────────────── */
-#linkphobot-header {
-    background: linear-gradient(135deg, #1E3A5F 0%, #2E6DA4 55%, #FF6B35 100%);
-    border-radius: 14px;
-    padding: 26px 36px;
-    margin-bottom: 20px;
-    text-align: center;
-    box-shadow: 0 6px 24px rgba(30,58,95,0.35);
-}
-#linkphobot-header h1 {
-    color: #FFFFFF !important;
-    font-size: 2.1rem !important;
-    font-weight: 800 !important;
-    margin: 0 0 4px 0 !important;
-    letter-spacing: -0.5px;
-}
-#linkphobot-header p {
-    color: #CBD5E0 !important;
-    font-size: 0.93rem !important;
-    margin: 0 !important;
-}
-
-/* ── Generate button ─────────────────────────────────── */
-#generate-btn {
-    background: linear-gradient(135deg, #FF6B35, #E85A25) !important;
-    border: none !important;
-    border-radius: 10px !important;
-    color: #FFFFFF !important;
-    font-size: 1.05rem !important;
-    font-weight: 700 !important;
-    padding: 14px !important;
-    width: 100% !important;
-    box-shadow: 0 4px 14px rgba(255,107,53,0.4) !important;
-    transition: transform 0.15s ease, box-shadow 0.15s ease !important;
-}
-#generate-btn:hover {
-    transform: translateY(-2px) !important;
-    box-shadow: 0 8px 20px rgba(255,107,53,0.55) !important;
-}
-
-/* ── Caption text area ───────────────────────────────── */
-#caption-out textarea {
-    font-size: 0.9rem !important;
-    line-height: 1.65 !important;
-}
-
-/* ── Status box ──────────────────────────────────────── */
-#status-box textarea {
-    font-size: 0.85rem !important;
-    font-weight: 600 !important;
-}
-
-/* ── Example buttons ─────────────────────────────────── */
-.example-btn {
-    font-size: 0.82rem !important;
-    padding: 6px 10px !important;
-    border-radius: 6px !important;
-}
-
-/* ── Footer ──────────────────────────────────────────── */
-#linkphobot-footer {
-    text-align: center;
-    color: #718096;
-    font-size: 0.78rem;
-    padding: 14px;
-    margin-top: 6px;
-    border-top: 1px solid #E2E8F0;
-}
-"""
-
-HEADER_HTML = """
-<div id="linkphobot-header">
-    <h1>🤖 Linkphobot</h1>
-    <p>AI-Powered LinkedIn Infographic Generator &nbsp;·&nbsp; Groq + Llama 3.3 + PIL &nbsp;·&nbsp; v1.0.0</p>
-</div>
-"""
-
-FOOTER_HTML = """
-<div id="linkphobot-footer">
-    Built with <strong>Linkphobot</strong> &nbsp;·&nbsp;
-    Powered by <strong>Groq</strong> + <strong>Llama 3.3 70B</strong> + <strong>Pillow</strong> &nbsp;·&nbsp;
-    <a href="https://console.groq.com/keys" target="_blank" style="color:#718096">Get Groq API Key →</a>
-</div>
-"""
-
-TEMPLATE_CHOICES = ["auto", "business", "educational", "technical"]
-
-COLOR_THEME_CHOICES = [
-    "auto",
-    "tech_purple",
-    "health_blue",
-    "finance_navy",
-    "executive_navy",
-    "eco_green",
-    "data_indigo",
-    "engineering_navy",
-    "cyber_dark",
-    "clean_blue",
-    "edu_teal",
-    "creative_coral",
-    "dev_dark",
-    "people_warm",
-    "professional",
-]
-
-CAPTION_STYLE_CHOICES = [
-    "educational",
-    "data_driven",
-    "thought_leadership",
-    "story",
-    "listicle",
-]
-
-EXPORT_PRESET_CHOICES = [
-    "linkedin",
-    "linkedin_hq",
-    "web",
-    "thumb",
-]
-
-MODEL_CHOICES = ["default", "fast", "quality"]
-
-EXAMPLE_TOPICS = [
+THEMES = ["auto","tech_purple","health_blue","finance_navy","executive_navy",
+          "eco_green","data_indigo","engineering_navy","cyber_dark","clean_blue",
+          "edu_teal","creative_coral","dev_dark","people_warm","professional"]
+MODELS  = ["default","fast","quality"]
+STYLES  = ["educational","data_driven","thought_leadership","story","listicle"]
+EXAMPLES= [
     "Artificial Intelligence in Healthcare",
     "Top 10 Leadership Skills for 2025",
     "How to Build a Personal Brand on LinkedIn",
     "Machine Learning for Beginners",
     "The Future of Remote Work",
     "Data Science Career Roadmap 2025",
-    "Habits of High-Performance Teams",
-    "Python vs JavaScript: Which to Learn First",
-    "The Rise of Generative AI in Business",
-    "Blockchain Technology Explained Simply",
 ]
 
+CSS = """
+.gradio-container{font-family:'Inter','Segoe UI',sans-serif !important;max-width:1200px !important;margin:auto !important}
+#gen-btn{background:linear-gradient(135deg,#FF6B35,#E85A25) !important;border:none !important;color:white !important;font-weight:700 !important;border-radius:10px !important;font-size:1.05rem !important;padding:14px !important;width:100% !important}
+#gen-btn:hover{transform:translateY(-2px) !important;box-shadow:0 8px 20px rgba(255,107,53,0.5) !important}
+"""
 
-# ════════════════════════════════════════════════════════════════════════════
-# GRADIO INTERFACE BUILDER
-# ════════════════════════════════════════════════════════════════════════════
+HEADER = """
+<div style="background:linear-gradient(135deg,#1E3A5F,#2E6DA4,#FF6B35);border-radius:14px;
+            padding:26px;text-align:center;margin-bottom:20px">
+  <h1 style="color:#FFF;margin:0;font-weight:800;font-size:2rem">🤖 Linkphobot</h1>
+  <p style="color:#CBD5E0;margin:6px 0 0;font-size:0.93rem">
+    AI-Powered LinkedIn Infographic Generator &nbsp;·&nbsp; Groq + Llama 3.3 + PIL &nbsp;·&nbsp; v1.0.0
+  </p>
+</div>
+"""
 
-def build_interface() -> gr.Blocks:
-    """
-    Build and return the complete Gradio Blocks interface.
+FOOTER = """
+<div style="text-align:center;color:#718096;font-size:0.78rem;padding:14px;
+            margin-top:6px;border-top:1px solid #E2E8F0">
+  Linkphobot &nbsp;·&nbsp; Groq + Llama 3.3 70B + Pillow &nbsp;·&nbsp;
+  <a href="https://console.groq.com/keys" target="_blank" style="color:#718096">
+    Get Free Groq API Key →</a>
+</div>
+"""
 
-    Layout:
-      Header
-      ┌────────────────┬──────────────────────────────┐
-      │ Controls (40%) │ Outputs (60%)                │
-      │                │  Status bar                  │
-      │  Topic input   │  Tabs:                       │
-      │  Examples      │    [Infographic] [Caption]   │
-      │  Template      │    [JSON]        [Info]      │
-      │  Theme         │                              │
-      │  Caption style │                              │
-      │  [Generate]    │                              │
-      │  [Clear]       │                              │
-      └────────────────┴──────────────────────────────┘
-      Footer
-    """
-    with gr.Blocks(
-        css   = CSS,
-        title = "Linkphobot — LinkedIn Infographic Generator",
-    ) as demo:
+def build_ui():
+    with gr.Blocks(css=CSS, title="Linkphobot — LinkedIn Infographic Generator") as demo:
 
-        # ── Header ────────────────────────────────────────────────────
-        gr.HTML(HEADER_HTML)
+        gr.HTML(HEADER)
 
-        # ── Main Row ──────────────────────────────────────────────────
-        with gr.Row(equal_height=False):
+        with gr.Row():
 
-            # ════════════════════════════════════════════════════════════
-            # LEFT COLUMN — Controls
-            # ════════════════════════════════════════════════════════════
+            # ── LEFT: Controls ────────────────────────────────────────
             with gr.Column(scale=4, min_width=320):
 
-                # ── Topic input ───────────────────────────────────────
-                topic_input = gr.Textbox(
-                    label       = "Topic",
-                    placeholder = "e.g. Artificial Intelligence in Healthcare",
-                    lines       = 2,
-                    max_lines   = 5,
-                    info        = "Be specific for best results — longer = better content",
-                    elem_id     = "topic-input",
-                )
+                topic_in = gr.Textbox(
+                    label="Topic",
+                    placeholder="e.g. Artificial Intelligence in Healthcare",
+                    lines=2, info="Be specific for best results")
 
-                # ── Quick example buttons ─────────────────────────────
-                gr.Markdown("**Quick start — click any topic:**")
+                gr.Markdown("**Quick start:**")
                 with gr.Row():
-                    ex_btn = [gr.Button(t[:36]+"..." if len(t)>36 else t,
-                                        size="sm", variant="secondary",
-                                        elem_classes=["example-btn"])
-                              for t in EXAMPLE_TOPICS[:2]]
+                    ex1 = gr.Button(EXAMPLES[0][:34]+"...", size="sm", variant="secondary")
+                    ex2 = gr.Button(EXAMPLES[1][:34]+"...", size="sm", variant="secondary")
                 with gr.Row():
-                    ex_btn += [gr.Button(t[:36]+"..." if len(t)>36 else t,
-                                         size="sm", variant="secondary",
-                                         elem_classes=["example-btn"])
-                               for t in EXAMPLE_TOPICS[2:4]]
+                    ex3 = gr.Button(EXAMPLES[2][:34]+"...", size="sm", variant="secondary")
+                    ex4 = gr.Button(EXAMPLES[3][:34]+"...", size="sm", variant="secondary")
                 with gr.Row():
-                    ex_btn += [gr.Button(t[:36]+"..." if len(t)>36 else t,
-                                         size="sm", variant="secondary",
-                                         elem_classes=["example-btn"])
-                               for t in EXAMPLE_TOPICS[4:6]]
+                    ex5 = gr.Button(EXAMPLES[4][:34]+"...", size="sm", variant="secondary")
+                    ex6 = gr.Button(EXAMPLES[5][:34]+"...", size="sm", variant="secondary")
 
                 gr.HTML("<hr style='border-color:#E2E8F0;margin:14px 0'>")
+                gr.Markdown("### Settings")
 
-                # ── Design settings ───────────────────────────────────
-                gr.Markdown("### Design Settings")
+                theme_dd = gr.Dropdown(THEMES, value="auto", label="Color Theme",
+                                        info="auto = detected from topic")
+                style_dd = gr.Dropdown(STYLES, value="educational", label="Caption Style")
 
-                template_dd = gr.Dropdown(
-                    choices = TEMPLATE_CHOICES,
-                    value   = "auto",
-                    label   = "Template Style",
-                    info    = "auto = selected based on topic domain",
-                )
-
-                color_theme_dd = gr.Dropdown(
-                    choices = COLOR_THEME_CHOICES,
-                    value   = "auto",
-                    label   = "Color Theme",
-                    info    = "auto = detected from topic keywords",
-                )
-
-                caption_style_dd = gr.Dropdown(
-                    choices = CAPTION_STYLE_CHOICES,
-                    value   = "educational",
-                    label   = "Caption Style",
-                    info    = "Tone and structure of the LinkedIn post",
-                )
-
-                gr.HTML("<hr style='border-color:#E2E8F0;margin:14px 0'>")
-
-                # ── Advanced settings (collapsed) ─────────────────────
                 with gr.Accordion("Advanced Settings", open=False):
-                    export_preset_dd = gr.Dropdown(
-                        choices = EXPORT_PRESET_CHOICES,
-                        value   = "linkedin",
-                        label   = "Export Preset",
-                        info    = "linkedin = 1080x1350 PNG (recommended)",
-                    )
-                    model_dd = gr.Dropdown(
-                        choices = MODEL_CHOICES,
-                        value   = "default",
-                        label   = "AI Model",
-                        info    = "default = llama-3.3-70b (recommended)",
-                    )
-                    api_key_input = gr.Textbox(
-                        label       = "Groq API Key (optional)",
-                        placeholder = "gsk_... leave blank if set in Secrets",
-                        type        = "password",
-                        info        = "Only needed if GROQ_API_KEY is not in HF/Colab Secrets",
-                    )
-                    status_btn = gr.Button("Check System Status", size="sm",
-                                           variant="secondary")
+                    model_dd  = gr.Dropdown(MODELS, value="default", label="AI Model")
+                    api_key_in= gr.Textbox(
+                        label="Groq API Key",
+                        placeholder="gsk_... paste your key here if secrets not working",
+                        type="password",
+                        info="Get free key at console.groq.com/keys")
 
                 gr.HTML("<hr style='border-color:#E2E8F0;margin:14px 0'>")
 
-                # ── Primary action buttons ────────────────────────────
-                generate_btn = gr.Button(
-                    "Generate Infographic",
-                    variant  = "primary",
-                    elem_id  = "generate-btn",
-                )
-
-                with gr.Row():
-                    clear_btn = gr.Button("Clear", variant="stop", size="sm")
+                gen_btn   = gr.Button("Generate Infographic", variant="primary", elem_id="gen-btn")
+                clear_btn = gr.Button("Clear", variant="stop", size="sm")
 
                 gr.Markdown("""
 ### How to Use
-1. **Enter a topic** — any professional subject
-2. **Adjust settings** — template, theme, caption style
-3. **Click Generate** — AI creates content + renders infographic
-4. **Preview, copy, download** — LinkedIn-ready PNG + caption
+1. Enter a topic
+2. Choose color theme
+3. Click **Generate**
+4. Download your PNG + copy caption
 """)
 
-            # ════════════════════════════════════════════════════════════
-            # RIGHT COLUMN — Outputs
-            # ════════════════════════════════════════════════════════════
+            # ── RIGHT: Outputs ────────────────────────────────────────
             with gr.Column(scale=6, min_width=480):
 
-                # ── Status bar ────────────────────────────────────────
-                status_text = gr.Textbox(
-                    label       = "Status",
-                    value       = f"[{datetime.now().strftime('%H:%M:%S')}] Ready — enter a topic and click Generate",
-                    interactive = False,
-                    lines       = 1,
-                    max_lines   = 2,
-                    elem_id     = "status-box",
-                )
+                status_box = gr.Textbox(
+                    label="Status",
+                    value=f"[{datetime.now().strftime('%H:%M:%S')}] Ready",
+                    interactive=False, lines=1, max_lines=2)
 
-                # ── Output Tabs ───────────────────────────────────────
                 with gr.Tabs():
-
-                    # ── Tab 1: Infographic preview ────────────────────
                     with gr.Tab("🖼 Infographic"):
-                        image_output = gr.Image(
-                            label  = "Generated Infographic (1080 × 1350 px)",
-                            type   = "pil",
-                            height = 580,
-                            
-                        )
-                        download_file = gr.File(
-                            label = "Download PNG",
-                        )
-                        seo_info_box = gr.Textbox(
-                            label       = "Analytics",
-                            interactive = False,
-                            lines       = 1,
-                            max_lines   = 2,
-                            placeholder = "SEO grade, word count, token usage appear here after generation",
-                        )
+                        img_out = gr.Image(label="Generated Infographic (1080×1350)",
+                                            type="pil", height=560)
+                        dl_file = gr.File(label="Download PNG")
 
-                    # ── Tab 2: LinkedIn Caption ───────────────────────
                     with gr.Tab("✍ Caption"):
-                        caption_output = gr.Textbox(
-                            label            = "LinkedIn Post — Copy & Paste Ready",
-                            lines            = 18,
-                            max_lines        = 35,
-                            interactive      = True,
-                            placeholder      = "Your LinkedIn caption appears here after generation...\n\nYou can edit it before copying.",
-                            
-                            elem_id          = "caption-out",
-                        )
-                        gr.Markdown(
-                            "*Tip: Edit the caption freely before copying. "
-                            "The copy button copies the full post including hashtags.*"
-                        )
+                        cap_out = gr.Textbox(
+                            label="LinkedIn Post — Copy & Paste Ready",
+                            lines=16, max_lines=30, interactive=True,
+                            placeholder="Your LinkedIn caption appears here...")
 
-                    # ── Tab 3: Content JSON ───────────────────────────
                     with gr.Tab("📋 JSON"):
-                        json_output = gr.Code(
-                            label    = "Generated Content Structure",
-                            language = "json",
-                            value    = "{}",
-                        )
+                        json_out = gr.Code(label="Content Structure",
+                                           language="json", value="{}")
 
-                    # ── Tab 4: Generation info ────────────────────────
                     with gr.Tab("ℹ Info"):
-                        metadata_box = gr.Textbox(
-                            label       = "Generation Details",
-                            lines       = 16,
-                            interactive = False,
-                            placeholder = "Phase timings and generation metadata appear here...",
-                        )
+                        meta_out = gr.Textbox(label="Generation Details",
+                                               lines=12, interactive=False)
 
-        # ── Footer ────────────────────────────────────────────────────
-        gr.HTML(FOOTER_HTML)
+        gr.HTML(FOOTER)
 
-        # ════════════════════════════════════════════════════════════════
-        # INPUTS & OUTPUTS — mapped to every event handler
-        # ════════════════════════════════════════════════════════════════
+        # ── Outputs / Inputs lists ────────────────────────────────────
+        OUTPUTS = [status_box, img_out, cap_out, dl_file, json_out, meta_out]
+        INPUTS  = [topic_in, theme_dd, model_dd, style_dd, api_key_in]
 
-        INPUTS = [
-            topic_input,
-            template_dd,
-            color_theme_dd,
-            caption_style_dd,
-            export_preset_dd,
-            model_dd,
-            api_key_input,
-        ]
+        # ── Wire events ───────────────────────────────────────────────
+        gen_btn.click(fn=generate, inputs=INPUTS, outputs=OUTPUTS)
+        topic_in.submit(fn=generate, inputs=INPUTS, outputs=OUTPUTS)
+        clear_btn.click(fn=clear,   inputs=[],     outputs=OUTPUTS)
 
-        OUTPUTS = [
-            status_text,
-            image_output,
-            caption_output,
-            seo_info_box,
-            download_file,
-            json_output,
-            metadata_box,
-        ]
-
-        # ════════════════════════════════════════════════════════════════
-        # EVENT WIRING
-        # ════════════════════════════════════════════════════════════════
-
-        # Generate button click
-        generate_btn.click(
-            fn      = generate_infographic,
-            inputs  = INPUTS,
-            outputs = OUTPUTS,
-        )
-
-        # Enter key in topic box also generates
-        topic_input.submit(
-            fn      = generate_infographic,
-            inputs  = INPUTS,
-            outputs = OUTPUTS,
-        )
-
-        # Clear button resets all outputs
-        clear_btn.click(
-            fn      = clear_outputs,
-            inputs  = [],
-            outputs = OUTPUTS,
-        )
-
-        # Example topic buttons — each sets the topic input
-        for btn, topic_text in zip(ex_btn, EXAMPLE_TOPICS[:6]):
-            btn.click(
-                fn      = lambda t=topic_text: t,
-                inputs  = [],
-                outputs = [topic_input],
-            )
-
-        # System status check
-        status_btn.click(
-            fn      = check_system_status,
-            inputs  = [api_key_input],
-            outputs = [status_text],
-        )
+        ex1.click(fn=lambda: EXAMPLES[0], inputs=[], outputs=[topic_in])
+        ex2.click(fn=lambda: EXAMPLES[1], inputs=[], outputs=[topic_in])
+        ex3.click(fn=lambda: EXAMPLES[2], inputs=[], outputs=[topic_in])
+        ex4.click(fn=lambda: EXAMPLES[3], inputs=[], outputs=[topic_in])
+        ex5.click(fn=lambda: EXAMPLES[4], inputs=[], outputs=[topic_in])
+        ex6.click(fn=lambda: EXAMPLES[5], inputs=[], outputs=[topic_in])
 
     return demo
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# LAUNCH CONFIGURATION
-# ════════════════════════════════════════════════════════════════════════════
-
-def _get_launch_config() -> dict:
-    """Return Gradio launch kwargs based on environment."""
-    is_hf_space = bool(os.environ.get("SPACE_ID"))
-    is_colab    = os.path.exists("/content") or "google.colab" in sys.modules
-    share_env   = os.environ.get("LINKPHOBOT_SHARE","").lower()
-    share       = share_env in ("true","1","yes") or is_colab
-
-    if is_hf_space:
-        # HF Spaces: bind to 0.0.0.0:7860, no public share link needed
-        return {
-            "server_name": "0.0.0.0",
-            "server_port": 7860,
-            "share":       False,
-            "show_error":  True,
-        }
-
-    if is_colab:
-        # Colab: share=True creates the public tunneled URL
-        return {
-            "share":      True,
-            "show_error": True,
-        }
-
-    # Local development
-    return {
-        "server_name": "0.0.0.0",
-        "server_port": int(os.environ.get("LINKPHOBOT_PORT", 7860)),
-        "share":       share,
-        "show_error":  True,
-        "inbrowser":   True,
-    }
-
-
-# ════════════════════════════════════════════════════════════════════════════
-# MAIN
+# STARTUP
 # ════════════════════════════════════════════════════════════════════════════
 
 def main():
-    print("=" * 55)
+    print("=" * 50)
     print("  LINKPHOBOT v1.0.0")
-    print("  LinkedIn Infographic Generator")
-    print("=" * 55)
+    print("=" * 50)
 
-    # Load API key at startup
-    key = _load_api_key()
-    if key:
-        print(f"[Linkphobot] GROQ_API_KEY: loaded ({key[:8]}...)")
+    key = get_api_key()
+    print(f"API key: {'loaded (' + key[:8] + '...)' if key else 'NOT SET (user must enter in UI)'}")
+
+    is_hf    = bool(os.environ.get("SPACE_ID"))
+    is_colab = os.path.exists("/content")
+
+    demo = build_ui()
+
+    if is_hf:
+        demo.queue(max_size=5).launch(server_name="0.0.0.0", server_port=7860,
+                                       share=False, show_error=True)
+    elif is_colab:
+        demo.queue(max_size=3).launch(share=True, show_error=True)
     else:
-        print("[Linkphobot] GROQ_API_KEY: NOT SET — user can enter in UI")
-
-    # Verify pipeline
-    pipeline = _get_pipeline()
-    if pipeline:
-        print("[Linkphobot] main_pipeline.py: loaded")
-        pm = getattr(pipeline, "PathManager", None)
-        if pm:
-            found = sum(1 for p in range(1,11) if pm.find_phase_dir(p))
-            print(f"[Linkphobot] Phase folders found: {found}/10")
-    else:
-        print("[Linkphobot] WARNING: main_pipeline.py not found")
-        print("             Place main_pipeline.py in same folder as app.py")
-
-    # Build and launch UI
-    print("\n[Linkphobot] Building Gradio interface...")
-    demo   = build_interface()
-    config = _get_launch_config()
-    print(f"[Linkphobot] Launching: port={config.get('server_port',7860)} share={config.get('share',False)}\n")
-
-    demo.queue(max_size=5).launch(**config)
-
+        demo.queue(max_size=3).launch(server_name="0.0.0.0", server_port=7860,
+                                       share=False, inbrowser=True, show_error=True)
 
 if __name__ == "__main__":
     main()
