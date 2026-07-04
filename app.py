@@ -4,7 +4,7 @@ app.py - Linkphobot
 Standalone LinkedIn Infographic Generator for Hugging Face Spaces.
 Self-contained: no main_pipeline.py dependency needed.
 
-HF Secret name: GROQ_API_KEY  OR  Linkphobot_API  (either works)
+API key is hardcoded directly below (no Hugging Face Secrets used).
 """
 
 import os, sys, json, re, time, tempfile, traceback
@@ -15,18 +15,16 @@ import gradio as gr
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# API KEY  — checks every possible secret name
+# API KEY  — hardcoded directly (HF Secrets not used)
 # ════════════════════════════════════════════════════════════════════════════
+
+GROQ_API_KEY = "gsk_PASTE_YOUR_GROQ_API_KEY_HERE"
+
 
 def get_api_key(user_key: str = "") -> str:
     if user_key and user_key.strip():
         return user_key.strip()
-    for name in ["GROQ_API_KEY", "Linkphobot_API", "LINKPHOBOT_API",
-                 "groq_api_key", "linkphobot_api"]:
-        val = os.environ.get(name, "").strip()
-        if val:
-            return val
-    return ""
+    return GROQ_API_KEY
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -466,7 +464,7 @@ def build_ui():
                     model_dd  = gr.Dropdown(MODELS, value="default", label="AI Model")
                     api_key_in= gr.Textbox(
                         label="Groq API Key",
-                        placeholder="gsk_... paste your key here if secrets not working",
+                        placeholder="gsk_... (leave blank to use the hardcoded key)",
                         type="password",
                         info="Get free key at console.groq.com/keys")
 
@@ -551,12 +549,20 @@ def main():
 
     if is_hf:
         demo.queue(max_size=5).launch(server_name="0.0.0.0", server_port=7860,
-                                       share=False, show_error=True)
+                                       share=False, show_error=True, ssr_mode=False)
     elif is_colab:
-        demo.queue(max_size=3).launch(share=True, show_error=True)
+        demo.queue(max_size=3).launch(share=True, show_error=True, ssr_mode=False)
     else:
-        demo.queue(max_size=3).launch(server_name="0.0.0.0", server_port=7860,
-                                       share=False, inbrowser=True, show_error=True)
+        # Try a normal local launch first (works on a real local machine).
+        # Remote/containerized dev environments (Codespaces, Docker, cloud VMs)
+        # can't be reached as "localhost", so fall back to a public share link.
+        try:
+            demo.queue(max_size=3).launch(server_name="0.0.0.0", server_port=7860,
+                                           share=False, inbrowser=True, show_error=True,
+                                           ssr_mode=False)
+        except ValueError:
+            print("[Linkphobot] localhost not reachable — falling back to a public share link")
+            demo.queue(max_size=3).launch(share=True, show_error=True, ssr_mode=False)
 
 if __name__ == "__main__":
     main()
