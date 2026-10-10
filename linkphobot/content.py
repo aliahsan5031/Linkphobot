@@ -267,7 +267,13 @@ def _client_for(api_key: str):
         raise ContentError(
             "The 'groq' package is not installed. Run: pip install -r requirements.txt"
         ) from exc
-    return Groq(api_key=api_key)
+    try:
+        return Groq(api_key=api_key)
+    except Exception as exc:  # for example, incompatible groq and httpx versions
+        raise ContentError(
+            f"Could not start the Groq client ({type(exc).__name__}: {exc}). "
+            "Check that the installed groq and httpx versions are compatible."
+        ) from exc
 
 
 def _call_groq(client, model: str, prompt: str, retries: int = 3):
