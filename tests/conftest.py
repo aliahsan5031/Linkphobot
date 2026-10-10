@@ -27,10 +27,14 @@ class FakeClient:
     def __init__(self, *replies):
         self.replies = list(replies)
         self.calls = 0
+        self.models = []
+        self.kwargs = []
         self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._create))
 
     def _create(self, **kwargs):
         self.calls += 1
+        self.models.append(kwargs.get("model"))
+        self.kwargs.append(kwargs)
         reply = self.replies.pop(0) if len(self.replies) > 1 else self.replies[0]
         if isinstance(reply, Exception):
             raise reply
