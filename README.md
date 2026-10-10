@@ -12,12 +12,11 @@ license: mit
 
 # 🤖 Linkphobot
 
-**AI-Powered LinkedIn Infographic Generator** — turn any topic into a polished,
-ready-to-post LinkedIn infographic (1080×1350 PNG) plus a matching caption,
-in seconds.
+**AI-powered LinkedIn infographic generator.** Turn a topic into a polished,
+ready-to-post infographic (PNG) and a matching caption in seconds.
 
-Built with **Groq + Llama 3.3 70B** for content generation, **Pillow (PIL)**
-for rendering, and **Gradio** for the UI.
+Built with **Groq + Llama 3.3 70B** for content, **Pillow** for rendering and
+**Gradio** for the UI.
 
 ![Python](https://img.shields.io/badge/python-3.10%2B-blue)
 ![Gradio](https://img.shields.io/badge/gradio-5.9.1-orange)
@@ -27,84 +26,102 @@ for rendering, and **Gradio** for the UI.
 
 ## ✨ Features
 
-- **One-click generation** — enter a topic, get a full infographic + caption
-- **14 color themes** — auto-detected from your topic, or pick manually
-- **LinkedIn-ready captions** — hashtags, call-to-action, and SEO-aware copy
-- **Multiple AI models** — fast / default / quality Groq model tiers
-- **No paid dependencies** — runs entirely on Groq's free-tier API
+- **One-click generation**: enter a topic, get an infographic and a caption
+- **Caption styles that matter**: educational, data-driven, thought leadership, story or listicle each change how the post is written
+- **Edit and re-render for free**: fix any text in the JSON tab and re-render without another API call
+- **Batch mode**: one topic per line (up to 10), downloaded as a ZIP of PNGs and captions
+- **Two sizes**: portrait 4:5 (1080×1350) and square (1080×1080)
+- **Your own brand line** in the footer instead of a fixed one
+- **14 colour themes**, chosen from the topic or picked by hand, with text colours adjusted so they stay readable
+- **Adaptive layout**: text is measured and wrapped, so blocks never overlap and long content shrinks to fit instead of being cut off
+- **Faster and cheaper**: identical requests are cached, and transient Groq errors (rate limits, 5xx) are retried with backoff
+- **Free to run** on Groq's free tier
 
-## 🖼️ How It Works
-
-1. Enter a topic (e.g. *"Top 10 Leadership Skills for 2025"*)
-2. Choose a color theme and caption style
-3. Click **Generate Infographic**
-4. Download the PNG and copy the ready-to-post caption
-
-## 🚀 Getting Started
-
-### 1. Clone the repo
+## 🚀 Getting started
 
 ```bash
-git clone https://github.com/<your-username>/linkphobot.git
-cd linkphobot
-```
-
-### 2. Install dependencies
-
-```bash
+git clone https://github.com/aliahsan5031/Linkphobot.git
+cd Linkphobot
 pip install -r requirements.txt
 ```
 
-### 3. Add your Groq API key
+### Add your Groq API key
 
-Get a free key at [console.groq.com/keys](https://console.groq.com/keys), then
-open `app.py` and set it near the top of the file:
+Get a free key at [console.groq.com/keys](https://console.groq.com/keys). **Do not
+put it in the source code.** Provide it as an environment variable:
 
-```python
-GROQ_API_KEY = "gsk_your_real_key_here"
+```bash
+cp .env.example .env      # then edit .env and set GROQ_API_KEY=...
+# or:
+export GROQ_API_KEY=your_key_here
 ```
 
-> You can also paste a key directly into the "Groq API Key" field in the
-> app's Advanced Settings at runtime — this overrides the hardcoded key.
+- **Hugging Face Spaces:** *Settings → Variables and secrets → New secret* named `GROQ_API_KEY`.
+- **Anyone using the app** can also paste their own key under *Advanced Settings*. It is never written to disk or logged; it only lives in server memory while the app runs.
 
-### 4. Run the app
+### Run it
 
 ```bash
 python app.py
 ```
 
-The app will launch locally at `http://localhost:7860`.
+The app opens at `http://127.0.0.1:7860`. It only listens on your own machine by
+default, so a key in your environment is not exposed to the network. In a
+container or Codespace, set `GRADIO_SERVER_NAME=0.0.0.0`.
 
-## 📦 Project Structure
+### Optional settings
+
+| Variable | Purpose |
+|---|---|
+| `GROQ_API_KEY` | Groq API key |
+| `LINKPHOBOT_BRAND` | Default footer line, for example `Ali Ahsan \| linkedin.com/in/you` |
+| `LINKPHOBOT_FONT`, `LINKPHOBOT_FONT_BOLD` | Paths to your own `.ttf` files |
+
+## 📦 Project structure
 
 ```
-linkphobot/
-├── app.py              # Standalone Gradio app (content gen + rendering + UI)
-├── main_pipeline.py     # Modular pipeline version (same logic, class-based)
-├── requirements.txt     # Python dependencies
-└── README.md
+app.py                 Gradio UI only
+linkphobot/            the package the app uses
+  config.py            themes, sizes, models, key and brand lookup
+  content.py           prompt, Groq call with retry, JSON repair, validation, cache
+  caption.py           hashtag cleanup and per-style captions
+  render.py            adaptive Pillow renderer
+  export.py            PNG/ZIP saving and temp-file cleanup
+  pipeline.py          generate, re-render and batch entry points
+tests/                 pytest suite (Groq is mocked, so it runs offline)
 ```
 
-## 🛠️ Tech Stack
+The other `*.py` files in the repository root (`main_pipeline.py`,
+`content_generator.py`, `layout_engine.py` and so on) are an earlier, separate
+pipeline. The app does not use them and they are unchanged. They are good
+candidates to archive or delete once you confirm you do not need them.
 
-| Layer          | Tool                          |
-|----------------|--------------------------------|
-| Content AI     | Groq API (Llama 3.3 70B)      |
-| Image Rendering| Pillow (PIL)                  |
-| UI             | Gradio 5.9.1                  |
-| Runtime        | Python 3.10+                  |
+## 🧪 Development
 
-## ⚠️ Security Note
+```bash
+pip install -r requirements-dev.txt
+ruff check .
+pytest
+```
 
-This project hardcodes the Groq API key directly in `app.py` for simplicity.
-**Do not commit your real key to a public repository.** If you fork or push
-this project publicly, either:
+Pushes and pull requests run lint and tests in GitHub Actions. A push to `main`
+only deploys to the Hugging Face Space if they pass.
 
-- Keep your real key out of version control (add it only in a local, private
-  copy or via the in-app key field), or
-- Switch back to loading it from an environment variable / secret manager
-  before pushing.
+## 🛠️ Tech stack
+
+| Layer | Tool |
+|---|---|
+| Content AI | Groq API (Llama 3.3 70B) |
+| Image rendering | Pillow |
+| UI | Gradio 5.9.1 |
+| Runtime | Python 3.10+ |
+
+## 🩺 Troubleshooting
+
+- **Tiny or odd-looking text:** no TrueType font was found. Install Liberation or DejaVu fonts, or set `LINKPHOBOT_FONT` and `LINKPHOBOT_FONT_BOLD`.
+- **`argument of type 'bool' is not iterable` at launch:** pydantic is too new for this Gradio version. `pip install -r requirements.txt` pins a compatible one.
+- **"Groq's rate limit was reached":** the free tier is rate limited. Wait a moment, or use the *fast* model.
 
 ## 📄 License
 
-MIT — see LICENSE for details.
+MIT. See [LICENSE](LICENSE).
