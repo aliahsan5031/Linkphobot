@@ -3,3 +3,10 @@ httpx==0.28.1
 Pillow==10.4.0
 gradio==5.9.1
 rich==13.7.1
+python-dotenv>=1.0
+
+# gradio 5.9.1 needs these two but does not pin them correctly:
+#  - requests: imported by gradio's CLI, missing from its declared dependencies
+#  - pydantic<2.11: newer releases crash gradio at launch ("argument of type 'bool' is not iterable")
+requests>=2.31
+pydantic>=2.10,<2.11
