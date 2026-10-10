@@ -19,11 +19,16 @@ MAX_TOPIC_LEN = 200
 MAX_BATCH = 10
 MAX_BRAND_LEN = 60
 
+# Groq retired llama-3.3-70b-versatile and llama-3.1-8b-instant on 2026-08-16
+# (requests now return 404). These are Groq's recommended replacements.
 MODELS = {
-    "default": "llama-3.3-70b-versatile",
-    "fast": "llama-3.1-8b-instant",
-    "quality": "llama-3.3-70b-versatile",
+    "default": "openai/gpt-oss-120b",
+    "fast": "openai/gpt-oss-20b",
+    "quality": "openai/gpt-oss-120b",
 }
+
+# Tried in order if the chosen model is unavailable (retired, renamed, no access).
+FALLBACK_MODELS = ("openai/gpt-oss-120b", "openai/gpt-oss-20b", "qwen/qwen3.6-27b")
 
 CAPTION_STYLES = ["educational", "data_driven", "thought_leadership", "story", "listicle"]
 

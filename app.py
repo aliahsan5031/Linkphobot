@@ -51,7 +51,7 @@ HEADER = f"""
             padding:26px;text-align:center;margin-bottom:20px">
   <h1 style="color:#FFF;margin:0;font-weight:800;font-size:2rem">🤖 Linkphobot</h1>
   <p style="color:#E2E8F0;margin:6px 0 0;font-size:0.93rem">
-    AI-Powered LinkedIn Infographic Generator &nbsp;·&nbsp; Groq + Llama 3.3 + Pillow
+    AI-Powered LinkedIn Infographic Generator &nbsp;·&nbsp; Groq + gpt-oss + Pillow
     &nbsp;·&nbsp; v{__version__}
   </p>
 </div>
@@ -60,7 +60,7 @@ HEADER = f"""
 FOOTER = """
 <div style="text-align:center;color:#4A5568;font-size:0.78rem;padding:14px;
             margin-top:6px;border-top:1px solid #E2E8F0">
-  Linkphobot &nbsp;·&nbsp; Groq + Llama 3.3 70B + Pillow &nbsp;·&nbsp;
+  Linkphobot &nbsp;·&nbsp; Groq + gpt-oss-120b + Pillow &nbsp;·&nbsp;
   <a href="https://console.groq.com/keys" target="_blank" style="color:#4A5568">
     Get a free Groq API key →</a>
 </div>

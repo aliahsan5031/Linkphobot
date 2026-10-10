@@ -14,6 +14,7 @@ from functools import lru_cache
 from .caption import normalize_hashtags
 from .config import (
     CAPTION_STYLES,
+    FALLBACK_MODELS,
     MAX_TOPIC_LEN,
     MIN_TOPIC_LEN,
     MODELS,
@@ -276,6 +277,18 @@ def _client_for(api_key: str):
         ) from exc
 
 
+class ModelUnavailable(ContentError):
+    """The requested model does not exist or this key cannot use it."""
+
+
+def _request_options(model: str) -> dict:
+    """Extra request fields for reasoning models, which think before answering."""
+    if model.startswith("openai/gpt-oss"):
+        # Keep the hidden reasoning short so the JSON answer is not cut off.
+        return {"extra_body": {"reasoning_effort": "low"}}
+    return {}
+
+
 def _call_groq(client, model: str, prompt: str, retries: int = 3):
     """One chat completion with exponential backoff on transient failures."""
     for attempt in range(1, retries + 1):
@@ -287,10 +300,13 @@ def _call_groq(client, model: str, prompt: str, retries: int = 3):
                     {"role": "user", "content": prompt},
                 ],
                 temperature=0.65,
-                max_tokens=2800,
+                max_tokens=6000,
+                **_request_options(model),
             )
         except Exception as exc:
             status = getattr(exc, "status_code", None)
+            if status == 404:
+                raise ModelUnavailable(_friendly(exc)) from exc
             if status in (401, 403):
                 raise ContentError(
                     "Groq rejected the API key. Check GROQ_API_KEY or the key you entered."
@@ -378,9 +394,18 @@ def generate_content(
         client = _client_for(api_key)
 
     started = time.time()
-    response = _call_groq(
-        client, MODELS.get(model, MODELS["default"]), build_prompt(topic, caption_style)
-    )
+    prompt = build_prompt(topic, caption_style)
+    chosen = MODELS.get(model, MODELS["default"])
+    response = None
+    for candidate in dict.fromkeys((chosen, *FALLBACK_MODELS)):
+        try:
+            response = _call_groq(client, candidate, prompt)
+            break
+        except ModelUnavailable as exc:
+            log.warning("Model %s unavailable (%s); trying the next one", candidate, exc)
+            last_error = exc
+    if response is None:
+        raise last_error
     raw = response.choices[0].message.content or ""
     try:
         data = validate(repair_json(raw), topic)

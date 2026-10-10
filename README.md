@@ -15,7 +15,7 @@ license: mit
 **AI-powered LinkedIn infographic generator.** Turn a topic into a polished,
 ready-to-post infographic (PNG) and a matching caption in seconds.
 
-Built with **Groq + Llama 3.3 70B** for content, **Pillow** for rendering and
+Built with **Groq + gpt-oss-120b** for content, **Pillow** for rendering and
 **Gradio** for the UI.
 
 ![Python](https://img.shields.io/badge/python-3.10%2B-blue)
@@ -111,7 +111,7 @@ only deploys to the Hugging Face Space if they pass.
 
 | Layer | Tool |
 |---|---|
-| Content AI | Groq API (Llama 3.3 70B) |
+| Content AI | Groq API (gpt-oss-120b) |
 | Image rendering | Pillow |
 | UI | Gradio 5.9.1 |
 | Runtime | Python 3.10+ |

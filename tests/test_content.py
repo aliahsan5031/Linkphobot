@@ -176,3 +176,24 @@ def test_malformed_model_output_becomes_a_clean_error():
 def test_missing_api_key_is_explained():
     with pytest.raises(ContentError, match="GROQ_API_KEY"):
         generate_content("topic here")
+
+
+def test_retired_model_falls_back_to_the_next_one(valid_reply):
+    client = FakeClient(FakeAPIError(404, "model does not exist"), valid_reply)
+    data = generate_content("topic here", client=client, use_cache=False)
+    assert data["title"]
+    assert client.models == ["openai/gpt-oss-120b", "openai/gpt-oss-20b"]
+
+
+def test_all_models_unavailable_gives_a_clean_error():
+    client = FakeClient(FakeAPIError(404, "model does not exist"))
+    with pytest.raises(ContentError, match="rejected the request"):
+        generate_content("topic here", client=client, use_cache=False)
+    assert client.calls == 3  # each distinct model tried once, no retry loop on 404
+
+
+def test_reasoning_models_get_low_effort_and_room_for_the_answer(valid_reply):
+    client = FakeClient(valid_reply)
+    generate_content("topic here", client=client, use_cache=False)
+    assert client.kwargs[0]["extra_body"] == {"reasoning_effort": "low"}
+    assert client.kwargs[0]["max_tokens"] >= 4000
