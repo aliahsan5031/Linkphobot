@@ -40,6 +40,19 @@ def test_generate_handler_shows_user_errors_without_a_traceback():
     assert "Traceback" not in caption
 
 
+def test_unexpected_errors_name_the_exception_type(monkeypatch):
+    def boom(*args, **kwargs):
+        raise TypeError("internal detail that should not reach the page")
+
+    monkeypatch.setattr(app, "run_one", boom)
+    status, image, caption, *_ = app.generate(
+        "A valid topic here", "auto", "default", "educational", "portrait", "", "k"
+    )
+    assert "TypeError" in status and "Space logs" in status
+    assert "internal detail" not in status + caption
+    assert image is None
+
+
 def test_rerender_handler_keeps_outputs_when_json_is_broken():
     out = app.rerender_edited("{ broken", "auto", "educational", "portrait", "")
     assert "syntax error" in out[0]

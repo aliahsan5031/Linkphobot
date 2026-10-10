@@ -71,6 +71,11 @@ def _stamp(message: str) -> str:
     return f"[{datetime.now():%H:%M:%S}] {message}"
 
 
+def _crash_message(exc: Exception) -> str:
+    """Unexpected errors: name the exception type so it can be diagnosed from the UI."""
+    return f"Something went wrong ({type(exc).__name__}). See the Space logs for details."
+
+
 def generate(topic, theme, model, style, size, brand, api_key_input):
     """Generate content, then render the image and caption."""
     started = time.time()
@@ -78,9 +83,9 @@ def generate(topic, theme, model, style, size, brand, api_key_input):
         result = run_one(topic, theme, model, style, size, brand, get_api_key(api_key_input))
     except ContentError as exc:
         return _stamp(str(exc)), None, str(exc), None, "{}", ""
-    except Exception:
+    except Exception as exc:
         log.exception("Unexpected error while generating")
-        message = "Something went wrong on our side. Please try again."
+        message = _crash_message(exc)
         return _stamp(message), None, message, None, "{}", ""
     done = f"Done in {time.time() - started:.1f}s | {result.title[:45]}"
     return (
@@ -100,10 +105,9 @@ def rerender_edited(json_text, theme, style, size, brand):
     except ContentError as exc:
         # keep the current image and JSON on screen so the edit can be fixed
         return (_stamp(str(exc)), *(gr.update() for _ in range(5)))
-    except Exception:
+    except Exception as exc:
         log.exception("Unexpected error while re-rendering")
-        return (_stamp("Something went wrong on our side. Please try again."),
-                *(gr.update() for _ in range(5)))
+        return (_stamp(_crash_message(exc)), *(gr.update() for _ in range(5)))
     return (
         _stamp(f"Re-rendered from your edits | {result.title[:45]}"),
         result.image,
@@ -124,9 +128,9 @@ def generate_batch(topics_text, theme, model, style, size, brand, api_key_input,
         )
     except ContentError as exc:
         return None, str(exc)
-    except Exception:
+    except Exception as exc:
         log.exception("Unexpected error in batch run")
-        return None, "Something went wrong on our side. Please try again."
+        return None, _crash_message(exc)
     return zip_path, summary
 
 
