@@ -39,8 +39,7 @@ def test_portrait_keeps_every_block_for_typical_content():
     _, boxes = render_with_layout(make_payload(), size="portrait")
     names = [b["name"] for b in boxes]
     assert names == [
-        "header", "section_1", "section_2", "section_3", "section_4",
-        "key_points", "stats", "footer",
+        "header", "section_row_1", "section_row_2", "key_points", "stats", "footer",
     ]
 
 
@@ -122,3 +121,39 @@ def test_wrap_splits_a_word_wider_than_the_line():
 
 def test_default_font_is_scalable():
     assert load_font(40).getlength("Hello") > load_font(12).getlength("Hello")
+
+
+def test_bundled_fonts_load_and_differ_by_weight():
+    from linkphobot.render import _bundled_bytes
+
+    for weight in ("regular", "medium", "semibold", "bold", "display"):
+        assert _bundled_bytes(weight), f"{weight} font is missing or unreadable"
+    regular = load_font(40, weight="regular").getlength("Linkphobot")
+    bold = load_font(40, weight="bold").getlength("Linkphobot")
+    assert bold > regular
+
+
+def test_text_survives_greek_and_cyrillic_without_missing_glyph_boxes():
+    font = load_font(40, weight="regular")
+    # the .notdef box is wider than a real letter; both scripts should measure like letters
+    assert font.getlength("Привет") < 6 * 40
+    assert font.getlength("Γειά") < 4 * 40
+
+
+def test_percent_values_get_a_ring_and_others_do_not():
+    from linkphobot.render import _percent
+
+    assert _percent("94%") == 0.94
+    assert _percent("12.5 %") == 0.125
+    assert _percent("$150B") is None
+    assert _percent("300%") is None  # over 100 % cannot be shown as a ring
+
+
+def test_rendered_image_is_downsampled_to_the_exact_canvas():
+    img = render_infographic(make_payload(), size="square")
+    assert img.size == SIZES["square"] and img.mode == "RGB"
+
+
+def test_dense_content_output_has_no_blank_canvas():
+    img = render_infographic(make_payload())
+    assert len(img.getcolors(maxcolors=5_000_000)) > 500  # gradients, shadows, text

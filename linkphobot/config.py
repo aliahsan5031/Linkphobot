@@ -11,7 +11,7 @@ try:  # optional: lets a local .env file provide GROQ_API_KEY
 except ImportError:  # pragma: no cover - python-dotenv is optional
     pass
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 DEFAULT_BRAND = "Linkphobot  |  AI-Powered LinkedIn Infographics"
 
 MIN_TOPIC_LEN = 3
