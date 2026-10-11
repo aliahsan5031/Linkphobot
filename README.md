@@ -33,6 +33,7 @@ Built with **Groq + gpt-oss-120b** for content, **Pillow** for rendering and
 - **Two sizes**: portrait 4:5 (1080×1350) and square (1080×1080)
 - **Your own brand line** in the footer instead of a fixed one
 - **14 colour themes**, chosen from the topic or picked by hand, with text colours adjusted so they stay readable
+- **Designed look**: two-column card grid, icons picked from each section's meaning, ring charts for percentage stats, soft shadows, smooth edges (drawn at 2x) and bundled Inter and Poppins fonts
 - **Adaptive layout**: text is measured and wrapped, so blocks never overlap and long content shrinks to fit instead of being cut off
 - **Faster and cheaper**: identical requests are cached, and transient Groq errors (rate limits, 5xx) are retried with backoff
 - **Free to run** on Groq's free tier
@@ -85,7 +86,9 @@ linkphobot/            the package the app uses
   config.py            themes, sizes, models, key and brand lookup
   content.py           prompt, Groq call with retry, JSON repair, validation, cache
   caption.py           hashtag cleanup and per-style captions
-  render.py            adaptive Pillow renderer
+  render.py            adaptive Pillow renderer (2x supersampled, card grid, ring charts)
+  icons.py             vector icons and keyword-based icon choice
+  assets/fonts/        bundled Inter and Poppins (text-encoded, see its README)
   export.py            PNG/ZIP saving and temp-file cleanup
   pipeline.py          generate, re-render and batch entry points
 tests/                 pytest suite (Groq is mocked, so it runs offline)
@@ -118,7 +121,7 @@ only deploys to the Hugging Face Space if they pass.
 
 ## 🩺 Troubleshooting
 
-- **Tiny or odd-looking text:** no TrueType font was found. Install Liberation or DejaVu fonts, or set `LINKPHOBOT_FONT` and `LINKPHOBOT_FONT_BOLD`.
+- **Different or missing letters:** the bundled fonts cover Latin, Greek and Cyrillic. For other scripts set `LINKPHOBOT_FONT` and `LINKPHOBOT_FONT_BOLD` to a font file that has them.
 - **`argument of type 'bool' is not iterable` at launch:** pydantic is too new for this Gradio version. `pip install -r requirements.txt` pins a compatible one.
 - **"Groq's rate limit was reached":** the free tier is rate limited. Wait a moment, or use the *fast* model.
 
